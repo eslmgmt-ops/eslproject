@@ -1,0 +1,629 @@
+import { NextRequest, NextResponse } from "next/server";
+
+const ALLOWED_ORIGINS = new Set([
+  "http://ebs50.local",
+  "http://169.254.139.79",
+  "http://169.254.139.79/",
+]);
+
+const CSV_HEADERS = [
+  "ProductId",
+  "TreezUUID",
+  "Barcode",
+  "Description",
+  "Brandname",
+  "Group",
+  "StandardPrice",
+  "SellPrice",
+  "Discount",
+  "DiscountTitle",
+  "Content",
+  "Unit",
+  "NotUsed",
+];
+
+// ─── Request Deduplication (Simple In-Memory Cache) ─────────────────────────
+
+const REQUEST_CACHE = new Map<
+  string,
+  { timestamp: number; promise: Promise<Record<string, unknown>[]> }
+>();
+const CACHE_TTL = 5000; // 5 seconds — prevents duplicate simultaneous requests
+
+function getCacheKey(location: string, limit?: number): string {
+  return `products:${location}:${limit ?? "all"}`;
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface DiscountSchedule {
+  type: string;
+  start_date: string;
+  end_date: string;
+  repeat?: string | {
+    interval_type?: string;
+    days?: string[];
+    end?: string | null;
+  };
+}
+
+interface DiscountCondition {
+  discount_condition_type: string;
+  discount_condition_value: string;
+  discount_condition_schedule?: DiscountSchedule;
+}
+
+interface TreezDiscount {
+  discount_id: string;
+  discount_title: string;
+  discount_method: string;
+  discount_amount: number;
+  discount_affinity: string;
+  discount_stackable: string;
+  discount_product_groups: string[];
+  discount_condition_detail: DiscountCondition[];
+}
+
+// ─── PST Schedule Checker ─────────────────────────────────────────────────────
+
+function getTimeMinutes(isoLike: string): number {
+  const m = isoLike.match(/T(\d{2}):(\d{2})/);
+  if (m) return Number(m[1]) * 60 + Number(m[2]);
+  const d = new Date(isoLike);
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function inferWeekdayFromText(text: string | undefined): string | null {
+  if (!text) return null;
+  const t = text.toLowerCase();
+  if (t.includes("monday") || /\bmon\b/.test(t)) return "Monday";
+  if (t.includes("tuesday") || /\btue\b/.test(t)) return "Tuesday";
+  if (t.includes("wednesday") || /\bwed\b/.test(t)) return "Wednesday";
+  if (t.includes("thursday") || /\bthu\b/.test(t)) return "Thursday";
+  if (t.includes("friday") || /\bfri\b/.test(t)) return "Friday";
+  if (t.includes("saturday") || /\bsat\b/.test(t)) return "Saturday";
+  if (t.includes("sunday") || /\bsun\b/.test(t)) return "Sunday";
+  return null;
+}
+
+const CANONICAL_WEEKDAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+] as const;
+
+function normalizeToFullWeekday(raw: string | undefined | null): string | null {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  for (const d of CANONICAL_WEEKDAYS) {
+    if (lower === d.toLowerCase()) return d;
+  }
+  return inferWeekdayFromText(s);
+}
+
+function isDiscountActiveNow(discount: TreezDiscount): boolean {
+  const nowPST = new Date(
+    new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles" })
+  );
+  const nowDate = nowPST;
+  const nowTimeMinutes = nowPST.getHours() * 60 + nowPST.getMinutes();
+  const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const todayName = dayNames[nowPST.getDay()];
+
+  const scheduleConditions = discount.discount_condition_detail?.filter(
+    (c) => c.discount_condition_type === "Schedule"
+  );
+
+  if (!scheduleConditions || scheduleConditions.length === 0) return false;
+
+  return scheduleConditions.some((condition) => {
+    const schedule = condition.discount_condition_schedule;
+    if (!schedule?.start_date || !schedule?.end_date) return false;
+
+    const start = new Date(schedule.start_date);
+    const end = new Date(schedule.end_date);
+    const startTimeMinutes = getTimeMinutes(schedule.start_date);
+    const endTimeMinutes = getTimeMinutes(schedule.end_date);
+
+    if (schedule.type === "DO_NOT") {
+      const startDateOnly = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+      const endDateOnly = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+      const nowDateOnly = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate());
+      return nowDateOnly >= startDateOnly && nowDateOnly <= endDateOnly;
+    }
+
+    if (schedule.type === "WEEK" || schedule.type === "CUSTOM") {
+      const repeat = schedule.repeat as { days?: string[]; end?: string | null } | undefined;
+      if (repeat?.end) {
+        const repeatEnd = new Date(repeat.end);
+        if (nowDate > repeatEnd) return false;
+      }
+
+      const allowedDays: string[] = [];
+      if (repeat?.days && Array.isArray(repeat.days) && repeat.days.length > 0) {
+        for (const d of repeat.days) {
+          const n = normalizeToFullWeekday(d);
+          if (n) allowedDays.push(n);
+        }
+      } else if (typeof schedule.repeat === "string") {
+        const n = inferWeekdayFromText(schedule.repeat);
+        if (n) allowedDays.push(n);
+      }
+      if (allowedDays.length === 0) {
+        const n = inferWeekdayFromText(condition.discount_condition_value);
+        if (n) allowedDays.push(n);
+      }
+      if (allowedDays.length === 0) return false;
+      if (!allowedDays.includes(todayName)) return false;
+
+      return nowTimeMinutes >= startTimeMinutes && nowTimeMinutes <= endTimeMinutes;
+    }
+
+    if (schedule.type === "MONTH") {
+      return nowTimeMinutes >= startTimeMinutes && nowTimeMinutes <= endTimeMinutes;
+    }
+
+    return true;
+  });
+}
+
+// ─── Discount Resolver ────────────────────────────────────────────────────────
+
+function getBestActiveDiscount(product: Record<string, unknown>): {
+  percent: number;
+  title: string;
+} | null {
+  const discounts = product.discounts as TreezDiscount[] | undefined;
+  if (!discounts || discounts.length === 0) return null;
+
+  let best: { percent: number; title: string } | null = null;
+
+  for (const d of discounts) {
+    if (d.discount_method !== "PERCENT") continue;
+
+    const amount = Number(d.discount_amount ?? 0);
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+
+    if (!isDiscountActiveNow(d)) continue;
+
+    if (!best || amount > best.percent) {
+      best = { percent: amount, title: d.discount_title };
+    }
+  }
+
+  return best;
+}
+
+/** Wide date window so `isDiscountActiveNow` stays true for demo PERCENT rows */
+function demoPercentDiscount(id: string, title: string, percent: number): TreezDiscount {
+  const start = new Date();
+  start.setUTCFullYear(start.getUTCFullYear() - 1);
+  const end = new Date();
+  end.setUTCFullYear(end.getUTCFullYear() + 1);
+  return {
+    discount_id: id,
+    discount_title: title,
+    discount_method: "PERCENT",
+    discount_amount: percent,
+    discount_affinity: "ANY",
+    discount_stackable: "NO",
+    discount_product_groups: [],
+    discount_condition_detail: [
+      {
+        discount_condition_type: "Schedule",
+        discount_condition_value: "",
+        discount_condition_schedule: {
+          type: "DO_NOT",
+          start_date: start.toISOString(),
+          end_date: end.toISOString(),
+        },
+      },
+    ],
+  };
+}
+
+const DEMO_PRODUCTS: Record<string, unknown>[] = [
+  {
+    product_id: "550e8400-e29b-41d4-a716-446655440001",
+    name: "Blue Dream 3.5g",
+    brand: "Demo Farms",
+    category_type: "Flower",
+    product_configurable_fields: {
+      name: "Blue Dream 3.5g",
+      brand: "Demo Farms",
+      size: "3.5",
+      size_unit: "G",
+    },
+    pricing: { price_sell: 35 },
+    product_barcodes: [{ barcode: "850012345001" }],
+    discounts: [],
+  },
+  {
+    product_id: "550e8400-e29b-41d4-a716-446655440002",
+    name: "OG Kush 7g",
+    brand: "Demo Farms",
+    category_type: "Flower",
+    product_configurable_fields: {
+      name: "OG Kush 7g",
+      brand: "Demo Farms",
+      size: "7",
+      size_unit: "G",
+    },
+    pricing: { price_sell: 70 },
+    product_barcodes: [{ barcode: "850012345002" }],
+    discounts: [demoPercentDiscount("demo-d1", "Loyalty 15%", 15)],
+  },
+  {
+    product_id: "550e8400-e29b-41d4-a716-446655440003",
+    name: "House Preroll 1g",
+    brand: "Demo Labs",
+    category_type: "Preroll",
+    product_configurable_fields: {
+      name: "House Preroll 1g",
+      brand: "Demo Labs",
+      size: "1",
+      size_unit: "G",
+    },
+    pricing: { price_sell: 12, discounted_price: 9, discount_percent: 25 },
+    product_barcodes: [{ barcode: "850012345003" }],
+    discounts: [],
+  },
+  {
+    product_id: "550e8400-e29b-41d4-a716-446655440004",
+    name: "Sour Gummies 100mg",
+    brand: "Demo Edibles",
+    category_type: "Edible",
+    product_configurable_fields: {
+      name: "Sour Gummies 100mg",
+      brand: "Demo Edibles",
+      size: "100",
+      size_unit: "MG",
+    },
+    pricing: { price_sell: 22 },
+    product_barcodes: [{ barcode: "850012345004" }],
+    discounts: [demoPercentDiscount("demo-d2", "Weekend 10%", 10)],
+  },
+  {
+    product_id: "550e8400-e29b-41d4-a716-446655440005",
+    name: "Disposable Vape 0.5g",
+    brand: "Demo Oil Co",
+    category_type: "Vape",
+    product_configurable_fields: {
+      name: "Disposable Vape 0.5g",
+      brand: "Demo Oil Co",
+      size: "0.5",
+      size_unit: "G",
+    },
+    pricing: { price_sell: 28 },
+    product_barcodes: [{ barcode: "850012345005" }],
+    discounts: [],
+  },
+  {
+    product_id: "550e8400-e29b-41d4-a716-446655440006",
+    name: "Sparkling THC Soda",
+    brand: "Demo Beverages",
+    category_type: "Beverage",
+    product_configurable_fields: {
+      name: "Sparkling THC Soda",
+      brand: "Demo Beverages",
+      size: "12",
+      size_unit: "OZ",
+    },
+    pricing: { price_sell: 6 },
+    product_barcodes: [{ barcode: "850012345006" }],
+    discounts: [demoPercentDiscount("demo-d3", "Mix & Match 20%", 20)],
+  },
+];
+
+function getDemoProductSlice(limit?: number): Record<string, unknown>[] {
+  const copy = DEMO_PRODUCTS.map((p) => ({ ...p }));
+  if (limit === undefined) return copy;
+  return copy.slice(0, limit);
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Same field order as Treez `getTreezProductListId` (no network). */
+function getDemoProductListId(product: Record<string, unknown>): string {
+  const candidates: unknown[] = [
+    product.inventory_product_id,
+    product.inventoryProductId,
+    product.product_id,
+    product.productId,
+    product.id,
+    product.product_uuid,
+    product.productUuid,
+  ];
+  for (const c of candidates) {
+    const s = c !== undefined && c !== null ? String(c).trim() : "";
+    if (s) return s;
+  }
+  const barcodes = product.product_barcodes as Array<{ barcode?: string }> | undefined;
+  const bc = barcodes?.[0]?.barcode;
+  return bc !== undefined && bc !== null ? String(bc).trim() : "";
+}
+
+function csvEscape(value: unknown): string {
+  const s = value === undefined || value === null ? "" : String(value);
+  if (s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function getBarcodeOrFallback(product: Record<string, unknown>, index: number): string {
+  const barcodes = product.product_barcodes as Array<{ sku?: string; barcode?: string }> | undefined;
+  const barcode = barcodes?.[0]?.barcode ?? product.barcode;
+  if (barcode !== undefined && barcode !== null && String(barcode).trim() !== "") {
+    return String(barcode).trim();
+  }
+  return `${Date.now()}${index + 1}`.slice(-12);
+}
+
+function toStandardPrice(product: Record<string, unknown>): number {
+  const pricing = product.pricing as {
+    price_sell?: number;
+    tier_pricing_detail?: Array<{ price_per_value?: number }>;
+  } | undefined;
+  const raw = pricing?.price_sell ?? pricing?.tier_pricing_detail?.[0]?.price_per_value ?? 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// ─── CSV Builder (Streaming-Ready) ────────────────────────────────────────────
+
+function* generateCsvRows(products: Record<string, unknown>[]): Generator<string> {
+  // Header row
+  yield CSV_HEADERS.join(",");
+
+  // Product rows (for...of so yield stays in the generator body; forEach callbacks cannot yield)
+  for (const [index, product] of products.entries()) {
+    const cfg = product.product_configurable_fields as Record<string, unknown> | undefined;
+    const treezUuid = getDemoProductListId(product);
+    const standardPriceNum = toStandardPrice(product);
+    const standardPrice = standardPriceNum.toFixed(2);
+
+    let sellPrice = standardPrice;
+    let discount = "";
+    let discountTitle = "";
+
+    const bestDiscount = getBestActiveDiscount(product);
+    if (bestDiscount) {
+      const salePrice = Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100));
+      sellPrice = salePrice.toFixed(2);
+      discount = bestDiscount.percent.toFixed(2);
+      discountTitle = bestDiscount.title;
+    } else {
+      const pricing = product.pricing as {
+        discounted_price?: number;
+        discount_percent?: number;
+      } | undefined;
+
+      if (pricing?.discounted_price !== undefined && pricing.discounted_price !== null) {
+        const n = Number(pricing.discounted_price);
+        if (Number.isFinite(n) && n > 0 && n < standardPriceNum) {
+          sellPrice = n.toFixed(2);
+          discount = pricing.discount_percent
+            ? Number(pricing.discount_percent).toFixed(2)
+            : "";
+          discountTitle = "Product-Level Discount";
+        }
+      }
+    }
+
+    const row = [
+      String(index + 1).padStart(3, "0"),
+      treezUuid,
+      getBarcodeOrFallback(product, index),
+      String(cfg?.name ?? product.name ?? product.productName ?? ""),
+      String(cfg?.brand ?? product.brand ?? product.brandName ?? ""),
+      String(product.category_type ?? product.category ?? product.categoryName ?? ""),
+      standardPrice,
+      sellPrice,
+      discount,
+      discountTitle,
+      String(cfg?.size ?? ""),
+      String(cfg?.size_unit ?? "EA"),
+      "",
+    ].map(csvEscape).join(",");
+
+    yield row;
+  }
+}
+
+// ─── CORS Helper ──────────────────────────────────────────────────────────────
+
+function applyCors(request: NextRequest, response: NextResponse): NextResponse {
+  const origin = request.headers.get("origin");
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    response.headers.set("Access-Control-Allow-Origin", origin);
+    response.headers.set("Vary", "Origin");
+  }
+  response.headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+  response.headers.set("Access-Control-Max-Age", "86400");
+  return response;
+}
+
+// ─── Route Handlers ───────────────────────────────────────────────────────────
+
+export async function OPTIONS(request: NextRequest) {
+  return applyCors(request, new NextResponse(null, { status: 204 }));
+}
+
+export async function GET(request: NextRequest) {
+  const searchParams = request.nextUrl.searchParams;
+  const location = searchParams.get("location") || "FRONT OF HOUSE";
+  const format = (searchParams.get("format") || "").toLowerCase();
+  const wantsCsv = format === "csv" || request.headers.get("accept")?.includes("text/csv");
+  const rawLimit = searchParams.get("limit");
+  const parsedLimit = rawLimit ? Number(rawLimit) : undefined;
+  const limit =
+    parsedLimit !== undefined && Number.isFinite(parsedLimit) && parsedLimit > 0
+      ? Math.min(Math.floor(parsedLimit), 5000)
+      : undefined;
+  const cacheKey = getCacheKey(location, limit);
+
+  try {
+    // ✅ Deduplication: Check if request is already in-flight
+    const now = Date.now();
+    const cached = REQUEST_CACHE.get(cacheKey);
+
+    if (cached && now - cached.timestamp < CACHE_TTL) {
+      console.log(`[Demo products API] Using cached promise for: ${cacheKey}`);
+      const products = await cached.promise;
+
+      // Return CSV or JSON
+      if (wantsCsv) {
+        const csv = Array.from(generateCsvRows(products)).join("\n");
+        return applyCors(
+          request,
+          new NextResponse(csv, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/csv; charset=utf-8",
+              "Content-Disposition": `attachment; filename="demo-products-${location.replace(/\s+/g, "-").toLowerCase()}.csv"`,
+            },
+          })
+        );
+      }
+
+      const enrichedProducts = products.map((product: Record<string, unknown>) => {
+        const standardPriceNum = toStandardPrice(product);
+        const bestDiscount = getBestActiveDiscount(product);
+        return {
+          ...product,
+          resolved_discount: bestDiscount
+            ? {
+                discount_title: bestDiscount.title,
+                discount_percent: bestDiscount.percent,
+                standard_price: standardPriceNum,
+                sale_price: parseFloat(
+                  Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100)).toFixed(2)
+                ),
+              }
+            : null,
+        };
+      });
+
+      return applyCors(
+        request,
+        NextResponse.json({
+          success: true,
+          location,
+          limit: limit ?? null,
+          total: enrichedProducts.length,
+          discounts_applied: enrichedProducts.filter(
+            (p: Record<string, unknown> & { resolved_discount: unknown }) => p.resolved_discount
+          ).length,
+          products: enrichedProducts,
+        })
+      );
+    }
+
+    // ✅ Create promise and cache it (static demo — no Treez API)
+    const fetchPromise = Promise.resolve(getDemoProductSlice(limit)).then((rows) => {
+      console.log(`[Demo products API] Serving ${rows.length} static rows (location=${location})`);
+      return rows;
+    });
+
+    REQUEST_CACHE.set(cacheKey, {
+      timestamp: now,
+      promise: fetchPromise,
+    });
+
+    // Clean up old cache entries
+    for (const [key, value] of REQUEST_CACHE.entries()) {
+      if (now - value.timestamp > CACHE_TTL * 2) {
+        REQUEST_CACHE.delete(key);
+      }
+    }
+
+    const products = await fetchPromise;
+
+    const discountCount = products.filter(
+      (p: Record<string, unknown>) => getBestActiveDiscount(p) !== null
+    ).length;
+
+    console.log(
+      `[Demo products API] ${products.length} products, ${discountCount} with scheduled % discounts`
+    );
+
+    if (wantsCsv) {
+      // ✅ Stream CSV as generator to avoid single giant row
+      const csv = Array.from(generateCsvRows(products)).join("\n");
+
+      return applyCors(
+        request,
+        new NextResponse(csv, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/csv; charset=utf-8",
+            "Content-Disposition": `attachment; filename="demo-products-${location.replace(/\s+/g, "-").toLowerCase()}.csv"`,
+          },
+        })
+      );
+    }
+
+    // JSON response
+    const enrichedProducts = products.map((product: Record<string, unknown>) => {
+      const standardPriceNum = toStandardPrice(product);
+      const bestDiscount = getBestActiveDiscount(product);
+      return {
+        ...product,
+        resolved_discount: bestDiscount
+          ? {
+              discount_title: bestDiscount.title,
+              discount_percent: bestDiscount.percent,
+              standard_price: standardPriceNum,
+              sale_price: parseFloat(
+                Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100)).toFixed(2)
+              ),
+            }
+          : null,
+      };
+    });
+
+    return applyCors(
+      request,
+      NextResponse.json({
+        success: true,
+        location,
+        limit: limit ?? null,
+        total: enrichedProducts.length,
+        discounts_applied: discountCount,
+        products: enrichedProducts,
+      })
+    );
+
+  } catch (error: any) {
+    console.error("[Demo products API] Error:", error);
+
+    // Clear cache on error
+    REQUEST_CACHE.delete(cacheKey);
+
+    if (wantsCsv) {
+      return applyCors(
+        request,
+        new NextResponse(`${CSV_HEADERS.join(",")}\n`, {
+          status: 200,
+          headers: { "Content-Type": "text/csv; charset=utf-8" },
+        })
+      );
+    }
+
+    return applyCors(
+      request,
+      NextResponse.json(
+        { error: error.message || "Failed to load demo products" },
+        { status: 500 }
+      )
+    );
+  }
+}
