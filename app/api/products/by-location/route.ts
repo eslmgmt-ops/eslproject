@@ -236,68 +236,7 @@ function toStandardPrice(product: Record<string, unknown>): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-// ─── CSV Builder ──────────────────────────────────────────────────────────────
-
-function toCsv(products: Record<string, unknown>[]): string {
-  const lines: string[] = [CSV_HEADERS.join(",")];
-
-  products.forEach((product, index) => {
-    const cfg = product.product_configurable_fields as Record<string, unknown> | undefined;
-    const treezUuid = getTreezProductListId(product as any);
-    const standardPriceNum = toStandardPrice(product);
-    const standardPrice = standardPriceNum.toFixed(2);
-
-    let sellPrice = standardPrice;
-    let discount = "";
-    let discountTitle = "";
-
-    // Priority 1: Active PERCENT discount from product.discounts[] (PST schedule aware)
-    const bestDiscount = getBestActiveDiscount(product);
-    if (bestDiscount) {
-      const salePrice = Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100));
-      sellPrice = salePrice.toFixed(2);
-      discount = bestDiscount.percent.toFixed(2);
-      discountTitle = bestDiscount.title;
-    } else {
-      // Priority 2: Product-level discounted_price directly from Treez pricing object
-      const pricing = product.pricing as {
-        discounted_price?: number;
-        discount_percent?: number;
-      } | undefined;
-
-      if (pricing?.discounted_price !== undefined && pricing.discounted_price !== null) {
-        const n = Number(pricing.discounted_price);
-        if (Number.isFinite(n) && n > 0 && n < standardPriceNum) {
-          sellPrice = n.toFixed(2);
-          discount = pricing.discount_percent
-            ? Number(pricing.discount_percent).toFixed(2)
-            : "";
-          discountTitle = "Product-Level Discount";
-        }
-      }
-    }
-
-    const row = [
-      String(index + 1).padStart(3, "0"),
-      treezUuid,
-      getBarcodeOrFallback(product, index),
-      String(cfg?.name ?? product.name ?? product.productName ?? ""),
-      String(cfg?.brand ?? product.brand ?? product.brandName ?? ""),
-      String(product.category_type ?? product.category ?? product.categoryName ?? ""),
-      standardPrice,
-      sellPrice,
-      discount,
-      discountTitle,
-      String(cfg?.size ?? ""),
-      String(cfg?.size_unit ?? "EA"),
-      "",
-    ].map(csvEscape);
-
-    lines.push(row.join(","));
-  });
-
-  return lines.join("\n");
-}
+// ─── CORS Helper ──────────────────────────────────────────────────────────────
 
 function applyCors(request: NextRequest, response: NextResponse): NextResponse {
   const origin = request.headers.get("origin");
@@ -306,7 +245,7 @@ function applyCors(request: NextRequest, response: NextResponse): NextResponse {
     response.headers.set("Vary", "Origin");
   }
   response.headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
-  response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+  response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-API-Key");
   response.headers.set("Access-Control-Max-Age", "86400");
   return response;
 }
@@ -328,24 +267,167 @@ export async function GET(request: NextRequest) {
     parsedLimit !== undefined && Number.isFinite(parsedLimit) && parsedLimit > 0
       ? Math.min(Math.floor(parsedLimit), 5000)
       : undefined;
-  // Treez may reject very small page_size values (e.g. 10) with 400 — use at least 100.
-  // When `limit` is set, one page is enough at max(limit, 100). When unset, batch size comes from
-  // `TREEZ_PRODUCT_LIST_PAGE_SIZE` (e.g. 100) or defaults to 1000 per Treez request (still paginates until done).
-  const treezPageSize = limit !== undefined ? Math.max(limit, 100) : undefined;
 
   try {
+    // API Key Security (optional but recommended)
+    const apiKey = process.env.OPTICON_API_KEY;
+    if (apiKey) {
+      const requestApiKey = request.headers.get("x-api-key") || 
+                           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+                           searchParams.get("api_key");
+      
+      if (!requestApiKey || requestApiKey !== apiKey) {
+        console.warn(`[Location API] Unauthorized access attempt from ${request.headers.get("x-forwarded-for") || "unknown"}`);
+        return applyCors(request, NextResponse.json(
+          { error: "Unauthorized: Invalid or missing API key" },
+          { status: 401 }
+        ));
+      }
+    }
+
     console.log(`[Location API] Fetching products for location: ${location}`);
 
-    // Treez `fetchTreezProducts` follows pages until done when `page` is omitted.
+    if (wantsCsv) {
+      // Stream CSV to avoid memory issues with large datasets
+      const stream = new ReadableStream({
+        async start(controller) {
+          const encoder = new TextEncoder();
+          
+          try {
+            // Send CSV headers first
+            controller.enqueue(encoder.encode(CSV_HEADERS.join(",") + "\n"));
+            
+            let page = 1;
+            let totalProducts = 0;
+            let totalDiscounts = 0;
+            let hasMore = true;
+            const pageSize = 500; // Process in smaller batches
+            
+            while (hasMore && (!limit || totalProducts < limit)) {
+              console.log(`[Location API] Fetching page ${page} (batch size: ${pageSize})`);
+              
+              const fetchedProducts = await fetchTreezProducts({
+                active: "ALL",
+                above_threshold: true,
+                sellable_quantity_in_location: location,
+                include_discounts: true,
+                page_size: pageSize,
+                page: page,
+              });
+              
+              if (fetchedProducts.length === 0) {
+                hasMore = false;
+                break;
+              }
+              
+              // Process and stream each product
+              for (let i = 0; i < fetchedProducts.length; i++) {
+                if (limit && totalProducts >= limit) {
+                  hasMore = false;
+                  break;
+                }
+                
+                const product = fetchedProducts[i] as Record<string, unknown>;
+                const cfg = product.product_configurable_fields as Record<string, unknown> | undefined;
+                const treezUuid = getTreezProductListId(product as any);
+                const standardPriceNum = toStandardPrice(product);
+                const standardPrice = standardPriceNum.toFixed(2);
+                
+                let sellPrice = standardPrice;
+                let discount = "";
+                let discountTitle = "";
+                
+                const bestDiscount = getBestActiveDiscount(product);
+                if (bestDiscount) {
+                  const salePrice = Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100));
+                  sellPrice = salePrice.toFixed(2);
+                  discount = bestDiscount.percent.toFixed(2);
+                  discountTitle = bestDiscount.title;
+                  totalDiscounts++;
+                } else {
+                  const pricing = product.pricing as {
+                    discounted_price?: number;
+                    discount_percent?: number;
+                  } | undefined;
+                  
+                  if (pricing?.discounted_price !== undefined && pricing.discounted_price !== null) {
+                    const n = Number(pricing.discounted_price);
+                    if (Number.isFinite(n) && n > 0 && n < standardPriceNum) {
+                      sellPrice = n.toFixed(2);
+                      discount = pricing.discount_percent
+                        ? Number(pricing.discount_percent).toFixed(2)
+                        : "";
+                      discountTitle = "Product-Level Discount";
+                    }
+                  }
+                }
+                
+                const row = [
+                  String(totalProducts + 1).padStart(3, "0"),
+                  treezUuid,
+                  getBarcodeOrFallback(product, totalProducts),
+                  String(cfg?.name ?? product.name ?? product.productName ?? ""),
+                  String(cfg?.brand ?? product.brand ?? product.brandName ?? ""),
+                  String(product.category_type ?? product.category ?? product.categoryName ?? ""),
+                  standardPrice,
+                  sellPrice,
+                  discount,
+                  discountTitle,
+                  String(cfg?.size ?? ""),
+                  String(cfg?.size_unit ?? "EA"),
+                  "",
+                ].map(csvEscape);
+                
+                controller.enqueue(encoder.encode(row.join(",") + "\n"));
+                totalProducts++;
+              }
+              
+              // Check if we got fewer products than requested (last page)
+              if (fetchedProducts.length < pageSize) {
+                hasMore = false;
+              }
+              
+              page++;
+              
+              // Safety check
+              if (page > 100) {
+                console.warn(`[Location API] Stopped at page 100 for safety`);
+                hasMore = false;
+              }
+            }
+            
+            console.log(`[Location API] Streamed ${totalProducts} products, ${totalDiscounts} with active discounts`);
+            controller.close();
+          } catch (error: any) {
+            console.error("[Location API] Stream error:", error);
+            controller.error(error);
+          }
+        },
+      });
+      
+      const response = new NextResponse(stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `inline; filename="treez-${location.replace(/\s+/g, "-").toLowerCase()}.csv"`,
+          "Transfer-Encoding": "chunked",
+        },
+      });
+      
+      return applyCors(request, response);
+    }
+
+    // JSON response - keep original behavior with memory-safe limit
+    const treezPageSize = limit !== undefined ? Math.max(limit, 100) : 500;
     const fetchedProducts = await fetchTreezProducts({
       active: "ALL",
       above_threshold: true,
       sellable_quantity_in_location: location,
       include_discounts: true,
       page_size: treezPageSize,
-      ...(limit ? { page: 1 } : {}),
+      page: 1,
     });
-    const products = limit ? fetchedProducts.slice(0, limit) : fetchedProducts;
+    const products = limit ? fetchedProducts.slice(0, limit) : fetchedProducts.slice(0, 500);
 
     const discountCount = products.filter(
       (p) => getBestActiveDiscount(p as Record<string, unknown>) !== null
@@ -353,18 +435,6 @@ export async function GET(request: NextRequest) {
 
     console.log(`[Location API] Fetched ${products.length} products, ${discountCount} with active discounts`);
 
-    if (wantsCsv) {
-      const csv = toCsv(products);
-      return applyCors(request, new NextResponse(csv, {
-        status: 200,
-        headers: {
-          "Content-Type": "text/csv; charset=utf-8",
-          "Content-Disposition": `inline; filename="treez-${location.replace(/\s+/g, "-").toLowerCase()}.csv"`,
-        },
-      }));
-    }
-
-    // JSON — attach resolved discount to each product for debugging
     const enrichedProducts = products.map((product: Record<string, unknown>) => {
       const standardPriceNum = toStandardPrice(product);
       const bestDiscount = getBestActiveDiscount(product);

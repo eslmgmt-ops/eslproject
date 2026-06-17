@@ -36,8 +36,34 @@ npm run dev
 - `app/api/auth/` – Test Treez connection
 - `lib/treez.ts` – Treez API client
 
+## Opticon ESL Integration
+
+The `/api/products/by-location` endpoint provides **streaming CSV** output optimized for Opticon ESL Web Server (EBS-50).
+
+**Key Features:**
+- ✅ Streams 3000+ products without memory issues
+- ✅ Optional API key authentication
+- ✅ Real-time discount calculations (PST timezone aware)
+- ✅ Supports multiple locations via query parameter
+
+**Setup Guide:** See [OPTICON_API_SETUP.md](./OPTICON_API_SETUP.md) for complete configuration instructions.
+
+**Quick Start:**
+```
+https://eslproject.com/api/products/by-location?location=FRONT%20OF%20HOUSE&format=csv
+```
+
+## Security
+
+Set `OPTICON_API_KEY` in environment to enable API key authentication:
+```bash
+OPTICON_API_KEY=your-secure-key
+```
+
+Configure in Opticon request header: `X-API-Key: your-secure-key`
+
 ## Next Steps
 
-- Add EBS50 integration (POST to `/api/v2.0/Products/ChangeStrings`)
-- Map Treez product fields to Opticon format
+- ~~Add EBS50 integration~~ ✅ CSV API endpoint ready
+- ~~Map Treez product fields to Opticon format~~ ✅ Complete
 - Deploy agent in-store for EBS50 LAN access
