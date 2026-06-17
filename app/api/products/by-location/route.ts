@@ -292,6 +292,7 @@ export async function GET(request: NextRequest) {
       const stream = new ReadableStream({
         async start(controller) {
           const encoder = new TextEncoder();
+          const startTime = Date.now();
           
           try {
             // Send CSV headers first
@@ -301,7 +302,9 @@ export async function GET(request: NextRequest) {
             let totalProducts = 0;
             let totalDiscounts = 0;
             let hasMore = true;
-            const pageSize = 500; // Process in smaller batches
+            const pageSize = limit ? Math.min(limit, 500) : 500; // Adjust batch size for limits
+            
+            console.log(`[Location API] Starting stream - pageSize: ${pageSize}, limit: ${limit || 'none'}`);
             
             while (hasMore && (!limit || totalProducts < limit)) {
               console.log(`[Location API] Fetching page ${page} (batch size: ${pageSize})`);
@@ -396,7 +399,8 @@ export async function GET(request: NextRequest) {
               }
             }
             
-            console.log(`[Location API] Streamed ${totalProducts} products, ${totalDiscounts} with active discounts`);
+            const elapsed = Date.now() - startTime;
+            console.log(`[Location API] ✓ Streamed ${totalProducts} products, ${totalDiscounts} with active discounts in ${elapsed}ms`);
             controller.close();
           } catch (error: any) {
             console.error("[Location API] Stream error:", error);
