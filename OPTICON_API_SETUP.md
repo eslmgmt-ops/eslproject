@@ -180,7 +180,22 @@ The endpoint returns these columns (map in Opticon wizard):
 
 ## Testing
 
-### Test with curl (no auth):
+### Quick Test: Use Mock Data Endpoint First! 🎯
+
+**Before testing with real data, verify connectivity with the fast test endpoint:**
+
+```
+https://eslproject.com/api/products/test-csv?count=50
+```
+
+This returns dummy data **instantly** (< 1 second) to confirm:
+- ✅ EBS-50 can reach your server
+- ✅ Network/firewall is properly configured
+- ✅ CSV format is correctly parsed
+
+**See:** [TEST_CSV_ENDPOINT.md](./TEST_CSV_ENDPOINT.md) for complete test guide
+
+### Test Real API with curl (no auth):
 ```bash
 curl "https://eslproject.com/api/products/by-location?location=FRONT%20OF%20HOUSE&format=csv"
 ```
