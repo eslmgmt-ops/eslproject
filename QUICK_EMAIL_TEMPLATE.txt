@@ -1,0 +1,78 @@
+Subject: EBS-50 API CSV Connection - 100 Second Timeout Issue (Working Test Endpoints Provided)
+
+---
+
+Dear Opticon Support,
+
+I'm experiencing connection timeouts with the "Configure CSV from API connection" feature (Manual Section 8.4.1.1.3) on my EBS-50.
+
+ERROR MESSAGE:
+"Downloading CSV through API failed. Error: The request was canceled due to the configured HttpClient.Timeout of 100 seconds elapsing."
+
+ISSUE DETAILS:
+• Was working correctly until a few days ago with same configuration
+• All API endpoints work perfectly in Postman, browser, and curl (< 1 second response)
+• All attempts from EBS-50 timeout after exactly 100 seconds
+• Server logs show ZERO requests from EBS-50 (requests never arrive at server)
+• Multiple test endpoints created - all fail on EBS-50 but work everywhere else
+
+EBS-50 INFO:
+Model: EBS-50
+Firmware: [Your version]
+Serial: [Your serial]
+IP: [Your IP]
+Gateway: [Your gateway]
+DNS: [Your DNS]
+
+WORKING TEST ENDPOINTS (for your verification):
+
+1. Quick Demo (6 products, < 500ms):
+   https://eslproject.com/api/products/demo?format=csv
+
+2. Mock Data (50 products, < 1 second):
+   https://eslproject.com/api/products/test-csv?count=50
+
+3. Small Mock (10 products, < 500ms):
+   https://eslproject.com/api/products/test-csv?count=10
+
+4. Discounts (< 2 seconds):
+   https://eslproject.com/api/discounts?location=FRONT%20OF%20HOUSE&format=csv
+
+All return valid CSV format per manual specifications.
+All verified working externally.
+All fail on EBS-50 with same timeout error.
+
+CONFIGURATION USED:
+• API CSV Endpoint: https://eslproject.com/api/products/demo?format=csv
+• Request Headers: None (for testing)
+• Complete Reload Interval: 10
+• Navigation: Products → Set up new connection → Configure CSV from API connection
+
+DIAGNOSIS:
+Since endpoints respond in < 1 second externally but timeout at 100 seconds on EBS-50, and no requests reach the server, this appears to be an outbound HTTPS connection issue from the EBS-50.
+
+QUESTIONS:
+1. What network diagnostics are available on EBS-50?
+2. Are there known issues with recent firmware affecting outbound HTTPS?
+3. Could this be a DNS, SSL certificate, or proxy issue?
+4. Can the 100-second timeout indicate connection establishment failure vs slow response?
+5. What logs should I check on the EBS-50?
+
+NETWORK TESTS:
+[ ] EBS-50 can access external websites (google.com): YES/NO/UNTESTED
+[ ] No firewall changes on our network
+[ ] No proxy configured on EBS-50
+
+Please advise on troubleshooting steps or if you can test the provided endpoints from your end to verify they work correctly.
+
+Available for remote diagnostic session if needed.
+
+Thank you for your assistance!
+
+[Your Name]
+[Your Contact Info]
+[Your Time Zone]
+
+---
+
+P.S. You can test the endpoints directly - they return instant responses and valid CSV data. The issue is specifically with the EBS-50's ability to connect to them.

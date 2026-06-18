@@ -772,7 +772,7 @@ export async function fetchTreezProducts(
   defaultParams.page_size = String(resolveTreezProductListPageSize(options.page_size));
 
   const allProducts: TreezProduct[] = [];
-  let page = 1;
+  let page = options.page ?? 1; // Start from provided page or 1
   let hasMore = true;
   const singlePageMode = options.page !== undefined;
 
