@@ -250,6 +250,50 @@ function applyCors(request: NextRequest, response: NextResponse): NextResponse {
   return response;
 }
 
+// ─── Cache Layer ──────────────────────────────────────────────────────────────
+
+interface CachedProducts {
+  products: Record<string, unknown>[];
+  timestamp: number;
+}
+
+const productCache = new Map<string, CachedProducts>();
+const CACHE_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+
+function getCacheKey(location: string): string {
+  return `products_${location.toLowerCase().replace(/\s+/g, '_')}`;
+}
+
+async function getCachedOrFetchProducts(location: string): Promise<Record<string, unknown>[]> {
+  const cacheKey = getCacheKey(location);
+  const cached = productCache.get(cacheKey);
+  
+  // Return cached if still fresh
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION_MS) {
+    console.log(`[Location API] ✓ Cache HIT for ${location} (${cached.products.length} products)`);
+    return cached.products;
+  }
+  
+  // Fetch fresh data
+  console.log(`[Location API] Cache MISS for ${location} - fetching from Treez...`);
+  const products = await fetchTreezProducts({
+    active: "ALL",
+    above_threshold: true,
+    sellable_quantity_in_location: location,
+    include_discounts: true,
+    page_size: 500,
+  }) as Record<string, unknown>[];
+  
+  // Cache it
+  productCache.set(cacheKey, {
+    products,
+    timestamp: Date.now(),
+  });
+  
+  console.log(`[Location API] ✓ Cached ${products.length} products for ${location}`);
+  return products;
+}
+
 // ─── Route Handler ────────────────────────────────────────────────────────────
 
 export async function OPTIONS(request: NextRequest) {
