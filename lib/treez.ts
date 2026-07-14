@@ -232,7 +232,8 @@ export interface TreezProductResponse {
   product_list?: TreezProduct[];
 }
 
-let cachedToken: { token: string; expiresAt: number } | null = null;
+let cachedToken: { token: string; expiresAt: number; dispensary: string } | null = null;
+const cachedTokensByDispensary = new Map<string, { token: string; expiresAt: number }>();
 let lastTreezRequestAt = 0;
 
 function sleep(ms: number): Promise<void> {
@@ -285,23 +286,36 @@ async function fetchTreezWithRetry(
   throw new Error(`Treez request failed unexpectedly: ${context}`);
 }
 
-async function getBaseUrl(): Promise<string> {
+function resolveDispensary(dispensaryOverride?: string): string {
+  const dispensary = (dispensaryOverride ?? process.env.TREEZ_DISPENSARY ?? "").trim();
+  if (!dispensary) {
+    throw new Error("TREEZ_DISPENSARY must be set in environment (or pass dispensary override)");
+  }
+  return dispensary;
+}
+
+async function getBaseUrl(dispensaryOverride?: string): Promise<string> {
   const baseUrl = (process.env.TREEZ_API_URL ?? "").replace(/\/+$/, "");
-  const dispensary = process.env.TREEZ_DISPENSARY;
-  if (!baseUrl || !dispensary) {
-    throw new Error("TREEZ_API_URL and TREEZ_DISPENSARY must be set in environment");
+  const dispensary = resolveDispensary(dispensaryOverride);
+  if (!baseUrl) {
+    throw new Error("TREEZ_API_URL must be set in environment");
   }
   return `${baseUrl}/${dispensary}`;
 }
 
 /** Exported base URL helper for Treez route wrappers. */
-export async function getTreezApiBaseUrl(): Promise<string> {
-  return getBaseUrl();
+export async function getTreezApiBaseUrl(dispensaryOverride?: string): Promise<string> {
+  return getBaseUrl(dispensaryOverride);
 }
 
-export async function getTreezAccessToken(): Promise<string> {
-  if (cachedToken && cachedToken.expiresAt > Date.now() + 60000) {
-    return cachedToken.token;
+export async function getTreezAccessToken(dispensaryOverride?: string): Promise<string> {
+  const dispensary = resolveDispensary(dispensaryOverride);
+  const cached =
+    cachedTokensByDispensary.get(dispensary) ??
+    (cachedToken?.dispensary === dispensary ? cachedToken : null);
+
+  if (cached && cached.expiresAt > Date.now() + 60000) {
+    return cached.token;
   }
 
   const apiKey = process.env.TREEZ_API_KEY;
@@ -309,7 +323,7 @@ export async function getTreezAccessToken(): Promise<string> {
     throw new Error("TREEZ_API_KEY must be set in environment");
   }
 
-  const baseUrl = await getBaseUrl();
+  const baseUrl = await getBaseUrl(dispensary);
   
   // Add timeout to prevent hanging
   const controller = new AbortController();
@@ -340,10 +354,12 @@ export async function getTreezAccessToken(): Promise<string> {
     }
 
     const expiresIn = (data.expires_in || 7200) * 1000;
-    cachedToken = {
+    const entry = {
       token: data.access_token,
       expiresAt: Date.now() + expiresIn,
     };
+    cachedTokensByDispensary.set(dispensary, entry);
+    cachedToken = { ...entry, dispensary };
 
     return data.access_token;
   } catch (error) {
@@ -742,6 +758,8 @@ export interface FetchProductsOptions {
   include_discounts?: boolean;
   /** filter by internal tag (e.g., "ESL") */
   internal_tag?: string;
+  /** override TREEZ_DISPENSARY for this request only */
+  dispensary?: string;
 }
 
 /**
@@ -751,8 +769,8 @@ export interface FetchProductsOptions {
 export async function fetchTreezProducts(
   options: FetchProductsOptions = {}
 ): Promise<TreezProduct[]> {
-  const token = await getTreezAccessToken();
-  const baseUrl = await getBaseUrl();
+  const token = await getTreezAccessToken(options.dispensary);
+  const baseUrl = await getBaseUrl(options.dispensary);
 
   const defaultParams: Record<string, string> = {
     active: (options.active ?? "ALL").toLowerCase(),
@@ -855,8 +873,8 @@ export async function fetchTreezProductsPage(
   page: number = 1,
   options: Omit<FetchProductsOptions, "page"> = {}
 ): Promise<ProductListPageResult> {
-  const token = await getTreezAccessToken();
-  const baseUrl = await getBaseUrl();
+  const token = await getTreezAccessToken(options.dispensary);
+  const baseUrl = await getBaseUrl(options.dispensary);
 
   const params: Record<string, string> = {
     page: String(page),
