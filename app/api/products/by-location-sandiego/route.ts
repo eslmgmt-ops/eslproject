@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchTreezProducts, getTreezProductListId } from "@/lib/treez";
 
-/** Hardcoded San Diego Treez dispensary — API key / client id still from env */
+/** Hardcoded San Diego Treez credentials — does not use TREEZ_DISPENSARY / TREEZ_API_KEY from env */
 const TREEZ_DISPENSARY_SAN_DIEGO = "perfectunionsandiego";
+const TREEZ_API_KEY_SAN_DIEGO = "ZTllYTY4OTU1MzRiMjkxMmFhN";
 
 const ALLOWED_ORIGINS = new Set([
   "http://ebs50.local",
@@ -286,6 +287,7 @@ async function getCachedOrFetchProducts(location: string): Promise<Record<string
     include_discounts: true,
     page_size: 500,
     dispensary: TREEZ_DISPENSARY_SAN_DIEGO,
+    apiKey: TREEZ_API_KEY_SAN_DIEGO,
   }) as Record<string, unknown>[];
   
   // Cache it
@@ -451,6 +453,7 @@ export async function GET(request: NextRequest) {
       page_size: treezPageSize,
       page: 1,
       dispensary: TREEZ_DISPENSARY_SAN_DIEGO,
+      apiKey: TREEZ_API_KEY_SAN_DIEGO,
     });
     const products = limit ? fetchedProducts.slice(0, limit) : fetchedProducts.slice(0, 500);
 

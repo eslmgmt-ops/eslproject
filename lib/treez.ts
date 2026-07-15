@@ -308,19 +308,20 @@ export async function getTreezApiBaseUrl(dispensaryOverride?: string): Promise<s
   return getBaseUrl(dispensaryOverride);
 }
 
-export async function getTreezAccessToken(dispensaryOverride?: string): Promise<string> {
+export async function getTreezAccessToken(
+  dispensaryOverride?: string,
+  apiKeyOverride?: string
+): Promise<string> {
   const dispensary = resolveDispensary(dispensaryOverride);
-  const cached =
-    cachedTokensByDispensary.get(dispensary) ??
-    (cachedToken?.dispensary === dispensary ? cachedToken : null);
-
-  if (cached && cached.expiresAt > Date.now() + 60000) {
-    return cached.token;
+  const apiKey = (apiKeyOverride ?? process.env.TREEZ_API_KEY ?? "").trim();
+  if (!apiKey) {
+    throw new Error("TREEZ_API_KEY must be set in environment (or pass apiKey override)");
   }
 
-  const apiKey = process.env.TREEZ_API_KEY;
-  if (!apiKey) {
-    throw new Error("TREEZ_API_KEY must be set in environment");
+  const cacheKey = `${dispensary}::${apiKey}`;
+  const cached = cachedTokensByDispensary.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now() + 60000) {
+    return cached.token;
   }
 
   const baseUrl = await getBaseUrl(dispensary);
@@ -358,8 +359,10 @@ export async function getTreezAccessToken(dispensaryOverride?: string): Promise<
       token: data.access_token,
       expiresAt: Date.now() + expiresIn,
     };
-    cachedTokensByDispensary.set(dispensary, entry);
-    cachedToken = { ...entry, dispensary };
+    cachedTokensByDispensary.set(cacheKey, entry);
+    if (!apiKeyOverride) {
+      cachedToken = { ...entry, dispensary };
+    }
 
     return data.access_token;
   } catch (error) {
@@ -760,6 +763,8 @@ export interface FetchProductsOptions {
   internal_tag?: string;
   /** override TREEZ_DISPENSARY for this request only */
   dispensary?: string;
+  /** override TREEZ_API_KEY for this request only */
+  apiKey?: string;
 }
 
 /**
@@ -769,7 +774,7 @@ export interface FetchProductsOptions {
 export async function fetchTreezProducts(
   options: FetchProductsOptions = {}
 ): Promise<TreezProduct[]> {
-  const token = await getTreezAccessToken(options.dispensary);
+  const token = await getTreezAccessToken(options.dispensary, options.apiKey);
   const baseUrl = await getBaseUrl(options.dispensary);
 
   const defaultParams: Record<string, string> = {
@@ -873,7 +878,7 @@ export async function fetchTreezProductsPage(
   page: number = 1,
   options: Omit<FetchProductsOptions, "page"> = {}
 ): Promise<ProductListPageResult> {
-  const token = await getTreezAccessToken(options.dispensary);
+  const token = await getTreezAccessToken(options.dispensary, options.apiKey);
   const baseUrl = await getBaseUrl(options.dispensary);
 
   const params: Record<string, string> = {
