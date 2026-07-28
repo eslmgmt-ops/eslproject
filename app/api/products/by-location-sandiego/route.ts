@@ -9,6 +9,9 @@ const ALLOWED_ORIGINS = new Set([
   "http://ebs50.local",
   "http://169.254.139.79",
   "http://169.254.139.79/",
+  "https://ebs50.local",
+  "https://169.254.139.79",
+  "https://169.254.139.79/",
 ]);
 
 const CSV_HEADERS = [
