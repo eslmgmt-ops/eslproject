@@ -243,6 +243,77 @@ function toStandardPrice(product: Record<string, unknown>): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+/**
+ * Build a full CSV body for Opticon EBS.
+ * Uses CRLF line endings and no streaming — EBS clients often fail on chunked Transfer-Encoding.
+ */
+function buildOpticonCsv(products: Record<string, unknown>[]): { csv: string; discountCount: number } {
+  const lines: string[] = [CSV_HEADERS.join(",")];
+  let discountCount = 0;
+
+  for (let i = 0; i < products.length; i++) {
+    const product = products[i];
+    const cfg = product.product_configurable_fields as Record<string, unknown> | undefined;
+    const treezUuid = getTreezProductListId(product as any);
+    const standardPriceNum = toStandardPrice(product);
+    const standardPrice = standardPriceNum.toFixed(2);
+
+    let sellPrice = standardPrice;
+    let discount = "";
+    let discountTitle = "";
+
+    const bestDiscount = getBestActiveDiscount(product);
+    if (bestDiscount) {
+      const salePrice = Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100));
+      sellPrice = salePrice.toFixed(2);
+      discount = bestDiscount.percent.toFixed(2);
+      discountTitle = bestDiscount.title;
+      discountCount++;
+    } else {
+      const pricing = product.pricing as {
+        discounted_price?: number;
+        discount_percent?: number;
+      } | undefined;
+
+      if (pricing?.discounted_price !== undefined && pricing.discounted_price !== null) {
+        const n = Number(pricing.discounted_price);
+        if (Number.isFinite(n) && n > 0 && n < standardPriceNum) {
+          sellPrice = n.toFixed(2);
+          discount = pricing.discount_percent
+            ? Number(pricing.discount_percent).toFixed(2)
+            : "";
+          discountTitle = "Product-Level Discount";
+          discountCount++;
+        }
+      }
+    }
+
+    // Strip newlines inside fields so Opticon never sees a "one gigantic row" parse
+    const safeTitle = discountTitle.replace(/[\r\n]+/g, " ").trim();
+
+    const row = [
+      String(i + 1).padStart(3, "0"),
+      treezUuid,
+      getBarcodeOrFallback(product, i),
+      String(cfg?.name ?? product.name ?? product.productName ?? "").replace(/[\r\n]+/g, " "),
+      String(cfg?.brand ?? product.brand ?? product.brandName ?? "").replace(/[\r\n]+/g, " "),
+      String(product.category_type ?? product.category ?? product.categoryName ?? ""),
+      standardPrice,
+      sellPrice,
+      discount,
+      safeTitle,
+      String(cfg?.size ?? ""),
+      String(cfg?.size_unit ?? "EA"),
+      "",
+    ].map(csvEscape);
+
+    lines.push(row.join(","));
+  }
+
+  // CRLF is more compatible with older Windows/embedded HTTP clients (Opticon EBS)
+  return { csv: lines.join("\r\n") + "\r\n", discountCount };
+}
+
 // ─── CORS Helper ──────────────────────────────────────────────────────────────
 
 function applyCors(request: NextRequest, response: NextResponse): NextResponse {
@@ -267,8 +338,21 @@ interface CachedProducts {
 const productCache = new Map<string, CachedProducts>();
 const CACHE_DURATION_MS = 5 * 60 * 1000; // 5 minutes
 
+interface CachedCsv {
+  body: string;
+  discountCount: number;
+  productCount: number;
+  timestamp: number;
+}
+const csvCache = new Map<string, CachedCsv>();
+const CSV_CACHE_DURATION_MS = 2 * 60 * 1000; // 2 minutes — fast Opticon re-polls
+
 function getCacheKey(location: string): string {
   return `products_${TREEZ_DISPENSARY_SAN_DIEGO}_${location.toLowerCase().replace(/\s+/g, '_')}`;
+}
+
+function getCsvCacheKey(location: string, limit?: number): string {
+  return `${getCacheKey(location)}_csv_${limit ?? "all"}`;
 }
 
 async function getCachedOrFetchProducts(location: string): Promise<Record<string, unknown>[]> {
@@ -301,6 +385,31 @@ async function getCachedOrFetchProducts(location: string): Promise<Record<string
   
   console.log(`[Location API SD] ✓ Cached ${products.length} products for ${location}`);
   return products;
+}
+
+async function getBufferedCsv(location: string, limit?: number): Promise<CachedCsv> {
+  const csvKey = getCsvCacheKey(location, limit);
+  const cached = csvCache.get(csvKey);
+  if (cached && Date.now() - cached.timestamp < CSV_CACHE_DURATION_MS) {
+    console.log(`[Location API SD] ✓ CSV cache HIT (${cached.productCount} rows)`);
+    return cached;
+  }
+
+  const startTime = Date.now();
+  const allProducts = await getCachedOrFetchProducts(location);
+  const products = limit ? allProducts.slice(0, limit) : allProducts;
+  const { csv, discountCount } = buildOpticonCsv(products);
+  const entry: CachedCsv = {
+    body: csv,
+    discountCount,
+    productCount: products.length,
+    timestamp: Date.now(),
+  };
+  csvCache.set(csvKey, entry);
+  console.log(
+    `[Location API SD] ✓ Built buffered CSV: ${products.length} products, ${discountCount} discounts in ${Date.now() - startTime}ms (${csv.length} bytes)`
+  );
+  return entry;
 }
 
 // ─── Route Handler ────────────────────────────────────────────────────────────
@@ -341,108 +450,26 @@ export async function GET(request: NextRequest) {
     console.log(`[Location API SD] Fetching products for location: ${location} (dispensary: ${TREEZ_DISPENSARY_SAN_DIEGO})`);
 
     if (wantsCsv) {
-      // Stream CSV to avoid memory issues with large datasets
-      const stream = new ReadableStream({
-        async start(controller) {
-          const encoder = new TextEncoder();
-          const startTime = Date.now();
-          
-          try {
-            // Send CSV headers first
-            controller.enqueue(encoder.encode(CSV_HEADERS.join(",") + "\n"));
-            
-            let totalDiscounts = 0;
-            
-            console.log(`[Location API SD] Starting stream - limit: ${limit || 'none'}`);
-            
-            // Use cache for better performance - fetch all products once
-            const allProducts = await getCachedOrFetchProducts(location);
-            console.log(`[Location API SD] Total products available: ${allProducts.length}`);
-            
-            // Stream products in batches
-            const productsToStream = limit ? allProducts.slice(0, limit) : allProducts;
-            const totalToProcess = productsToStream.length;
-            
-            for (let i = 0; i < totalToProcess; i++) {
-              const product = productsToStream[i] as Record<string, unknown>;
-              
-              // Log progress every 500 products
-              if (i > 0 && i % 500 === 0) {
-                console.log(`[Location API SD] Streamed ${i}/${totalToProcess} products...`);
-              }
-              
-              const cfg = product.product_configurable_fields as Record<string, unknown> | undefined;
-              const treezUuid = getTreezProductListId(product as any);
-              const standardPriceNum = toStandardPrice(product);
-              const standardPrice = standardPriceNum.toFixed(2);
-              
-              let sellPrice = standardPrice;
-              let discount = "";
-              let discountTitle = "";
-              
-              const bestDiscount = getBestActiveDiscount(product);
-              if (bestDiscount) {
-                const salePrice = Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100));
-                sellPrice = salePrice.toFixed(2);
-                discount = bestDiscount.percent.toFixed(2);
-                discountTitle = bestDiscount.title;
-                totalDiscounts++;
-              } else {
-                const pricing = product.pricing as {
-                  discounted_price?: number;
-                  discount_percent?: number;
-                } | undefined;
-                
-                if (pricing?.discounted_price !== undefined && pricing.discounted_price !== null) {
-                  const n = Number(pricing.discounted_price);
-                  if (Number.isFinite(n) && n > 0 && n < standardPriceNum) {
-                    sellPrice = n.toFixed(2);
-                    discount = pricing.discount_percent
-                      ? Number(pricing.discount_percent).toFixed(2)
-                      : "";
-                    discountTitle = "Product-Level Discount";
-                  }
-                }
-              }
-              
-              const row = [
-                String(i + 1).padStart(3, "0"),
-                treezUuid,
-                getBarcodeOrFallback(product, i),
-                String(cfg?.name ?? product.name ?? product.productName ?? ""),
-                String(cfg?.brand ?? product.brand ?? product.brandName ?? ""),
-                String(product.category_type ?? product.category ?? product.categoryName ?? ""),
-                standardPrice,
-                sellPrice,
-                discount,
-                discountTitle,
-                String(cfg?.size ?? ""),
-                String(cfg?.size_unit ?? "EA"),
-                "",
-              ].map(csvEscape);
-              
-              controller.enqueue(encoder.encode(row.join(",") + "\n"));
-            }
-            
-            const elapsed = Date.now() - startTime;
-            console.log(`[Location API SD] ✓ Streamed ${totalToProcess} products, ${totalDiscounts} with active discounts in ${elapsed}ms`);
-            controller.close();
-          } catch (error: any) {
-            console.error("[Location API SD] Stream error:", error);
-            controller.error(error);
-          }
-        },
-      });
-      
-      const response = new NextResponse(stream, {
+      // Opticon EBS: prefer a complete buffered body + Content-Length (no chunked stream).
+      // Chunked Transfer-Encoding and slow TTFB often surface as:
+      // "Resource temporarily unavailable (www.eslproject.com:443)" then GetProductData null.
+      const { body, productCount, discountCount } = await getBufferedCsv(location, limit);
+      const bytes = new TextEncoder().encode(body);
+
+      const response = new NextResponse(bytes, {
         status: 200,
         headers: {
           "Content-Type": "text/csv; charset=utf-8",
           "Content-Disposition": `inline; filename="treez-sandiego-${location.replace(/\s+/g, "-").toLowerCase()}.csv"`,
-          "Transfer-Encoding": "chunked",
+          "Content-Length": String(bytes.byteLength),
+          "Cache-Control": "public, max-age=60",
+          "Connection": "close",
         },
       });
-      
+
+      console.log(
+        `[Location API SD] ✓ CSV response ready for Opticon: ${productCount} rows, ${discountCount} discounts, ${bytes.byteLength} bytes`
+      );
       return applyCors(request, response);
     }
 
@@ -497,10 +524,18 @@ export async function GET(request: NextRequest) {
   } catch (error: any) {
     console.error("[Location API SD] Error:", error);
     if (wantsCsv) {
-      return applyCors(request, new NextResponse(`${CSV_HEADERS.join(",")}\n`, {
-        status: 200,
-        headers: { "Content-Type": "text/csv; charset=utf-8" },
-      }));
+      // Fail loudly for Opticon — empty 200 CSV causes GetProductData null crashes.
+      return applyCors(request, new NextResponse(
+        `ERROR: ${error?.message || "Failed to fetch products"}\r\n`,
+        {
+          status: 503,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Retry-After": "30",
+          },
+        }
+      ));
     }
     return applyCors(request, NextResponse.json(
       { error: error.message || "Failed to fetch products" },
