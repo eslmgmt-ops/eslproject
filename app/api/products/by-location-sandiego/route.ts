@@ -17,7 +17,6 @@ const ALLOWED_ORIGINS = new Set([
 const CSV_HEADERS = [
   "ProductId",
   "TreezUUID",
-  "Barcode",
   "Description",
   "Brandname",
   "Group",
@@ -224,15 +223,6 @@ function csvEscape(value: unknown): string {
   return s;
 }
 
-function getBarcodeOrFallback(product: Record<string, unknown>, index: number): string {
-  const barcodes = product.product_barcodes as Array<{ sku?: string; barcode?: string }> | undefined;
-  const barcode = barcodes?.[0]?.barcode ?? product.barcode;
-  if (barcode !== undefined && barcode !== null && String(barcode).trim() !== "") {
-    return String(barcode).trim();
-  }
-  return `${Date.now()}${index + 1}`.slice(-12);
-}
-
 function toStandardPrice(product: Record<string, unknown>): number {
   const pricing = product.pricing as {
     price_sell?: number;
@@ -294,7 +284,6 @@ function buildOpticonCsv(products: Record<string, unknown>[]): { csv: string; di
     const row = [
       String(i + 1).padStart(3, "0"),
       treezUuid,
-      getBarcodeOrFallback(product, i),
       String(cfg?.name ?? product.name ?? product.productName ?? "").replace(/[\r\n]+/g, " "),
       String(cfg?.brand ?? product.brand ?? product.brandName ?? "").replace(/[\r\n]+/g, " "),
       String(product.category_type ?? product.category ?? product.categoryName ?? ""),
