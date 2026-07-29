@@ -451,7 +451,10 @@ export async function GET(request: NextRequest) {
           "Content-Type": "text/csv; charset=utf-8",
           "Content-Disposition": `inline; filename="treez-sandiego-${location.replace(/\s+/g, "-").toLowerCase()}.csv"`,
           "Content-Length": String(bytes.byteLength),
-          "Cache-Control": "public, max-age=60",
+          // Prevent CDN/browser from serving a pre-barcode-removal CSV
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+          "Pragma": "no-cache",
+          "X-ESL-CSV-Version": "sandiego-no-barcode-v2",
           "Connection": "close",
         },
       });
