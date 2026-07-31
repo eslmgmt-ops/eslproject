@@ -3,9 +3,8 @@ import { fetchTreezProducts, getTreezProductListId } from "@/lib/treez";
 
 /**
  * DEBUG / TEST clone of by-location-sandiego.
- * Treez fetch keeps only: above_threshold, sellable_quantity_in_location,
- * dispensary, apiKey. Uses library default page_size.
- * Omits: active, include_discounts (and explicit page_size).
+ * Same as production for discounts (include_discounts + active + page_size + CSV discount resolver).
+ * Only intentional difference: above_threshold=false so qty > 0 in location can appear.
  */
 /** Hardcoded San Diego Treez credentials — does not use TREEZ_DISPENSARY / TREEZ_API_KEY from env */
 const TREEZ_DISPENSARY_SAN_DIEGO = "perfectunionsandiego";
@@ -361,11 +360,14 @@ async function getCachedOrFetchProducts(location: string): Promise<Record<string
     return cached.products;
   }
   
-  // Fetch fresh data — debug filters only (no active / include_discounts / page_size override)
+  // Same discount fetch as production; only above_threshold differs (false ⇒ qty > 0)
   console.log(`${LOG_PREFIX} Cache MISS for ${location} - fetching from Treez (${TREEZ_DISPENSARY_SAN_DIEGO})...`);
   const products = await fetchTreezProducts({
-    above_threshold: true,
+    active: "ALL",
+    above_threshold: false,
     sellable_quantity_in_location: location,
+    include_discounts: true,
+    page_size: 500,
     dispensary: TREEZ_DISPENSARY_SAN_DIEGO,
     apiKey: TREEZ_API_KEY_SAN_DIEGO,
   }) as Record<string, unknown>[];
@@ -458,7 +460,7 @@ export async function GET(request: NextRequest) {
           // Prevent CDN/browser from serving a pre-barcode-removal CSV
           "Cache-Control": "no-store, no-cache, must-revalidate",
           "Pragma": "no-cache",
-          "X-ESL-CSV-Version": "sandiego-test-threshold-location-only-v1",
+          "X-ESL-CSV-Version": "sandiego-test-discounts-like-prod-v4",
           "Connection": "close",
         },
       });
@@ -469,10 +471,14 @@ export async function GET(request: NextRequest) {
       return applyCors(request, response);
     }
 
-    // JSON response — same debug Treez filters (library default page_size; page 1 only for JSON preview)
+    // JSON — same discount params as production CSV path (above_threshold false for debug)
+    const treezPageSize = limit !== undefined ? Math.max(limit, 100) : 500;
     const fetchedProducts = await fetchTreezProducts({
-      above_threshold: true,
+      active: "ALL",
+      above_threshold: false,
       sellable_quantity_in_location: location,
+      include_discounts: true,
+      page_size: treezPageSize,
       page: 1,
       dispensary: TREEZ_DISPENSARY_SAN_DIEGO,
       apiKey: TREEZ_API_KEY_SAN_DIEGO,
@@ -507,9 +513,12 @@ export async function GET(request: NextRequest) {
       success: true,
       debug: true,
       fetch_params: {
-        above_threshold: true,
+        active: "ALL",
+        above_threshold: false,
         sellable_quantity_in_location: location,
-        note: "omitted active + include_discounts; page_size = library default",
+        include_discounts: true,
+        page_size: treezPageSize,
+        note: "discounts same as production; only above_threshold=false for qty>0 debug",
       },
       dispensary: TREEZ_DISPENSARY_SAN_DIEGO,
       location,
