@@ -1,0 +1,543 @@
+import { NextRequest, NextResponse } from "next/server";
+import { fetchTreezProducts, getTreezProductListId } from "@/lib/treez";
+
+/**
+ * DEBUG / TEST clone of by-location-sandiego.
+ * Treez fetch keeps only: above_threshold, sellable_quantity_in_location,
+ * dispensary, apiKey. Uses library default page_size.
+ * Omits: active, include_discounts (and explicit page_size).
+ */
+/** Hardcoded San Diego Treez credentials — does not use TREEZ_DISPENSARY / TREEZ_API_KEY from env */
+const TREEZ_DISPENSARY_SAN_DIEGO = "perfectunionsandiego";
+const TREEZ_API_KEY_SAN_DIEGO = "ZTllYTY4OTU1MzRiMjkxMmFhN";
+const LOG_PREFIX = "[Location API SD TEST]";
+
+const ALLOWED_ORIGINS = new Set([
+  "http://ebs50.local",
+  "http://169.254.139.79",
+  "http://169.254.139.79/",
+  "https://ebs50.local",
+  "https://169.254.139.79",
+  "https://169.254.139.79/",
+]);
+
+const CSV_HEADERS = [
+  "ProductId",
+  "TreezUUID",
+  "Description",
+  "Brandname",
+  "Group",
+  "StandardPrice",
+  "SellPrice",
+  "Discount",
+  "DiscountTitle",
+  "Content",
+  "Unit",
+  "NotUsed",
+];
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface DiscountSchedule {
+  type: string;           // "DO_NOT" | "WEEK" | "CUSTOM" | "MONTH"
+  start_date: string;     // "2025-11-24T00:00"
+  end_date: string;       // "2026-01-01T23:59"
+  repeat?: string | {
+    interval_type?: string;
+    days?: string[];
+    end?: string | null;
+  };
+}
+
+interface DiscountCondition {
+  discount_condition_type: string;   // "Schedule" | "Fulfillment Type" | "Customer Group" | "Bogo Condition"
+  discount_condition_value: string;
+  discount_condition_schedule?: DiscountSchedule;
+}
+
+interface TreezDiscount {
+  discount_id: string;
+  discount_title: string;
+  discount_method: string;       // "PERCENT" | "DOLLAR" | "BOGO" | "COST"
+  discount_amount: number;       // For PERCENT: 40 means 40%
+  discount_affinity: string;     // "Pre-Cart" | "Cart"
+  discount_stackable: string;
+  discount_product_groups: string[];
+  discount_condition_detail: DiscountCondition[];
+}
+
+// ─── PST Schedule Checker ─────────────────────────────────────────────────────
+
+// All Treez schedules are in PST/PDT (America/Los_Angeles)
+function getTimeMinutes(isoLike: string): number {
+  const m = isoLike.match(/T(\d{2}):(\d{2})/);
+  if (m) return Number(m[1]) * 60 + Number(m[2]);
+  const d = new Date(isoLike);
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function inferWeekdayFromText(text: string | undefined): string | null {
+  if (!text) return null;
+  const t = text.toLowerCase();
+  if (t.includes("monday") || /\bmon\b/.test(t)) return "Monday";
+  if (t.includes("tuesday") || /\btue\b/.test(t)) return "Tuesday";
+  if (t.includes("wednesday") || /\bwed\b/.test(t)) return "Wednesday";
+  if (t.includes("thursday") || /\bthu\b/.test(t)) return "Thursday";
+  if (t.includes("friday") || /\bfri\b/.test(t)) return "Friday";
+  if (t.includes("saturday") || /\bsat\b/.test(t)) return "Saturday";
+  if (t.includes("sunday") || /\bsun\b/.test(t)) return "Sunday";
+  return null;
+}
+
+const CANONICAL_WEEKDAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+] as const;
+
+/** Map API values like "Monday", "MON", "WED" to canonical English weekday names. */
+function normalizeToFullWeekday(raw: string | undefined | null): string | null {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  for (const d of CANONICAL_WEEKDAYS) {
+    if (lower === d.toLowerCase()) return d;
+  }
+  return inferWeekdayFromText(s);
+}
+
+function isDiscountActiveNow(discount: TreezDiscount): boolean {
+  // Get current time in PST
+  const nowPST = new Date(
+    new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles" })
+  );
+  const nowDate = nowPST;
+  const nowTimeMinutes = nowPST.getHours() * 60 + nowPST.getMinutes();
+  const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const todayName = dayNames[nowPST.getDay()];
+
+  const scheduleConditions = discount.discount_condition_detail?.filter(
+    (c) => c.discount_condition_type === "Schedule"
+  );
+
+  // Business rule: if schedule/start-end is missing, do NOT apply discount.
+  if (!scheduleConditions || scheduleConditions.length === 0) return false;
+
+  return scheduleConditions.some((condition) => {
+    const schedule = condition.discount_condition_schedule;
+    if (!schedule?.start_date || !schedule?.end_date) return false;
+
+    const start = new Date(schedule.start_date); // e.g. "2025-11-24T00:00"
+    const end = new Date(schedule.end_date);     // e.g. "2026-01-01T23:59"
+    const startTimeMinutes = getTimeMinutes(schedule.start_date);
+    const endTimeMinutes = getTimeMinutes(schedule.end_date);
+
+    // DO_NOT repeat — one-time discount with a date range
+    // e.g. start: 2025-11-24, end: 2026-01-01 → valid if today is within that range
+    if (schedule.type === "DO_NOT") {
+      // Compare dates only (ignore time) for multi-day ranges
+      const startDateOnly = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+      const endDateOnly = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+      const nowDateOnly = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate());
+      return nowDateOnly >= startDateOnly && nowDateOnly <= endDateOnly;
+    }
+
+    // WEEK / CUSTOM repeat — check day of week + time window
+    if (schedule.type === "WEEK" || schedule.type === "CUSTOM") {
+      const repeat = schedule.repeat as { days?: string[]; end?: string | null } | undefined;
+
+      // Check if repeat has ended
+      if (repeat?.end) {
+        const repeatEnd = new Date(repeat.end);
+        if (nowDate > repeatEnd) return false;
+      }
+
+      // Check day of week: every entry in repeat.days (CUSTOM can list multiple weekdays).
+      const allowedDays: string[] = [];
+      if (repeat?.days && Array.isArray(repeat.days) && repeat.days.length > 0) {
+        for (const d of repeat.days) {
+          const n = normalizeToFullWeekday(d);
+          if (n) allowedDays.push(n);
+        }
+      } else if (typeof schedule.repeat === "string") {
+        const n = inferWeekdayFromText(schedule.repeat);
+        if (n) allowedDays.push(n);
+      }
+      if (allowedDays.length === 0) {
+        const n = inferWeekdayFromText(condition.discount_condition_value);
+        if (n) allowedDays.push(n);
+      }
+      if (allowedDays.length === 0) return false;
+      if (!allowedDays.includes(todayName)) return false;
+
+      // Check time window
+      return nowTimeMinutes >= startTimeMinutes && nowTimeMinutes <= endTimeMinutes;
+    }
+
+    // MONTH repeat — check time window (simplified)
+    if (schedule.type === "MONTH") {
+      return nowTimeMinutes >= startTimeMinutes && nowTimeMinutes <= endTimeMinutes;
+    }
+
+    return true;
+  });
+}
+
+// ─── Discount Resolver ────────────────────────────────────────────────────────
+
+// Get the best (highest %) active PERCENT discount for a product
+// Uses product.discounts[] directly — no extra API call needed
+function getBestActiveDiscount(product: Record<string, unknown>): {
+  percent: number;
+  title: string;
+} | null {
+  const discounts = product.discounts as TreezDiscount[] | undefined;
+  if (!discounts || discounts.length === 0) return null;
+
+  let best: { percent: number; title: string } | null = null;
+
+  for (const d of discounts) {
+    // Phase 1: PERCENT only
+    if (d.discount_method !== "PERCENT") continue;
+
+    const amount = Number(d.discount_amount ?? 0);
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+
+    // Check if this discount is currently active (PST schedule)
+    if (!isDiscountActiveNow(d)) continue;
+
+    // Pick highest % — conflict resolution rule
+    if (!best || amount > best.percent) {
+      best = { percent: amount, title: d.discount_title };
+    }
+  }
+
+  return best;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function csvEscape(value: unknown): string {
+  const s = value === undefined || value === null ? "" : String(value);
+  if (s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function toStandardPrice(product: Record<string, unknown>): number {
+  const pricing = product.pricing as {
+    price_sell?: number;
+    tier_pricing_detail?: Array<{ price_per_value?: number }>;
+  } | undefined;
+  const raw = pricing?.price_sell ?? pricing?.tier_pricing_detail?.[0]?.price_per_value ?? 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Build a full CSV body for Opticon EBS.
+ * Uses CRLF line endings and no streaming — EBS clients often fail on chunked Transfer-Encoding.
+ */
+function buildOpticonCsv(products: Record<string, unknown>[]): { csv: string; discountCount: number } {
+  const lines: string[] = [CSV_HEADERS.join(",")];
+  let discountCount = 0;
+
+  for (let i = 0; i < products.length; i++) {
+    const product = products[i];
+    const cfg = product.product_configurable_fields as Record<string, unknown> | undefined;
+    const treezUuid = getTreezProductListId(product as any);
+    const standardPriceNum = toStandardPrice(product);
+    const standardPrice = standardPriceNum.toFixed(2);
+
+    let sellPrice = standardPrice;
+    let discount = "";
+    let discountTitle = "";
+
+    const bestDiscount = getBestActiveDiscount(product);
+    if (bestDiscount) {
+      const salePrice = Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100));
+      sellPrice = salePrice.toFixed(2);
+      discount = bestDiscount.percent.toFixed(2);
+      discountTitle = bestDiscount.title;
+      discountCount++;
+    } else {
+      const pricing = product.pricing as {
+        discounted_price?: number;
+        discount_percent?: number;
+      } | undefined;
+
+      if (pricing?.discounted_price !== undefined && pricing.discounted_price !== null) {
+        const n = Number(pricing.discounted_price);
+        if (Number.isFinite(n) && n > 0 && n < standardPriceNum) {
+          sellPrice = n.toFixed(2);
+          discount = pricing.discount_percent
+            ? Number(pricing.discount_percent).toFixed(2)
+            : "";
+          discountTitle = "Product-Level Discount";
+          discountCount++;
+        }
+      }
+    }
+
+    // Strip newlines inside fields so Opticon never sees a "one gigantic row" parse
+    const safeTitle = discountTitle.replace(/[\r\n]+/g, " ").trim();
+
+    const row = [
+      String(i + 1).padStart(3, "0"),
+      treezUuid,
+      String(cfg?.name ?? product.name ?? product.productName ?? "").replace(/[\r\n]+/g, " "),
+      String(cfg?.brand ?? product.brand ?? product.brandName ?? "").replace(/[\r\n]+/g, " "),
+      String(product.category_type ?? product.category ?? product.categoryName ?? ""),
+      standardPrice,
+      sellPrice,
+      discount,
+      safeTitle,
+      String(cfg?.size ?? ""),
+      String(cfg?.size_unit ?? "EA"),
+      "",
+    ].map(csvEscape);
+
+    lines.push(row.join(","));
+  }
+
+  // CRLF is more compatible with older Windows/embedded HTTP clients (Opticon EBS)
+  return { csv: lines.join("\r\n") + "\r\n", discountCount };
+}
+
+// ─── CORS Helper ──────────────────────────────────────────────────────────────
+
+function applyCors(request: NextRequest, response: NextResponse): NextResponse {
+  const origin = request.headers.get("origin");
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    response.headers.set("Access-Control-Allow-Origin", origin);
+    response.headers.set("Vary", "Origin");
+  }
+  response.headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-API-Key");
+  response.headers.set("Access-Control-Max-Age", "86400");
+  return response;
+}
+
+// ─── Cache Layer ──────────────────────────────────────────────────────────────
+
+interface CachedProducts {
+  products: Record<string, unknown>[];
+  timestamp: number;
+}
+
+const productCache = new Map<string, CachedProducts>();
+const CACHE_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+
+interface CachedCsv {
+  body: string;
+  discountCount: number;
+  productCount: number;
+  timestamp: number;
+}
+const csvCache = new Map<string, CachedCsv>();
+const CSV_CACHE_DURATION_MS = 2 * 60 * 1000; // 2 minutes — fast Opticon re-polls
+
+function getCacheKey(location: string): string {
+  return `products_test_${TREEZ_DISPENSARY_SAN_DIEGO}_${location.toLowerCase().replace(/\s+/g, '_')}`;
+}
+
+function getCsvCacheKey(location: string, limit?: number): string {
+  return `${getCacheKey(location)}_csv_${limit ?? "all"}`;
+}
+
+async function getCachedOrFetchProducts(location: string): Promise<Record<string, unknown>[]> {
+  const cacheKey = getCacheKey(location);
+  const cached = productCache.get(cacheKey);
+  
+  // Return cached if still fresh
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION_MS) {
+    console.log(`${LOG_PREFIX} ✓ Cache HIT for ${location} (${cached.products.length} products)`);
+    return cached.products;
+  }
+  
+  // Fetch fresh data — debug filters only (no active / include_discounts / page_size override)
+  console.log(`${LOG_PREFIX} Cache MISS for ${location} - fetching from Treez (${TREEZ_DISPENSARY_SAN_DIEGO})...`);
+  const products = await fetchTreezProducts({
+    above_threshold: true,
+    sellable_quantity_in_location: location,
+    dispensary: TREEZ_DISPENSARY_SAN_DIEGO,
+    apiKey: TREEZ_API_KEY_SAN_DIEGO,
+  }) as Record<string, unknown>[];
+  
+  // Cache it
+  productCache.set(cacheKey, {
+    products,
+    timestamp: Date.now(),
+  });
+  
+  console.log(`${LOG_PREFIX} ✓ Cached ${products.length} products for ${location}`);
+  return products;
+}
+
+async function getBufferedCsv(location: string, limit?: number): Promise<CachedCsv> {
+  const csvKey = getCsvCacheKey(location, limit);
+  const cached = csvCache.get(csvKey);
+  if (cached && Date.now() - cached.timestamp < CSV_CACHE_DURATION_MS) {
+    console.log(`${LOG_PREFIX} ✓ CSV cache HIT (${cached.productCount} rows)`);
+    return cached;
+  }
+
+  const startTime = Date.now();
+  const allProducts = await getCachedOrFetchProducts(location);
+  const products = limit ? allProducts.slice(0, limit) : allProducts;
+  const { csv, discountCount } = buildOpticonCsv(products);
+  const entry: CachedCsv = {
+    body: csv,
+    discountCount,
+    productCount: products.length,
+    timestamp: Date.now(),
+  };
+  csvCache.set(csvKey, entry);
+  console.log(
+    `${LOG_PREFIX} ✓ Built buffered CSV: ${products.length} products, ${discountCount} discounts in ${Date.now() - startTime}ms (${csv.length} bytes)`
+  );
+  return entry;
+}
+
+// ─── Route Handler ────────────────────────────────────────────────────────────
+
+export async function OPTIONS(request: NextRequest) {
+  return applyCors(request, new NextResponse(null, { status: 204 }));
+}
+
+export async function GET(request: NextRequest) {
+  const searchParams = request.nextUrl.searchParams;
+  const location = searchParams.get("location") || "FRONT OF HOUSE";
+  const format = (searchParams.get("format") || "").toLowerCase();
+  const wantsCsv = format === "csv" || request.headers.get("accept")?.includes("text/csv");
+  const rawLimit = searchParams.get("limit");
+  const parsedLimit = rawLimit ? Number(rawLimit) : undefined;
+  const limit =
+    parsedLimit !== undefined && Number.isFinite(parsedLimit) && parsedLimit > 0
+      ? Math.min(Math.floor(parsedLimit), 5000)
+      : undefined;
+
+  try {
+    // API Key Security (optional but recommended)
+    const apiKey = process.env.OPTICON_API_KEY;
+    if (apiKey) {
+      const requestApiKey = request.headers.get("x-api-key") || 
+                           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+                           searchParams.get("api_key");
+      
+      if (!requestApiKey || requestApiKey !== apiKey) {
+        console.warn(`${LOG_PREFIX} Unauthorized access attempt from ${request.headers.get("x-forwarded-for") || "unknown"}`);
+        return applyCors(request, NextResponse.json(
+          { error: "Unauthorized: Invalid or missing API key" },
+          { status: 401 }
+        ));
+      }
+    }
+
+    console.log(`${LOG_PREFIX} Fetching products for location: ${location} (dispensary: ${TREEZ_DISPENSARY_SAN_DIEGO})`);
+
+    if (wantsCsv) {
+      // Opticon EBS: prefer a complete buffered body + Content-Length (no chunked stream).
+      // Chunked Transfer-Encoding and slow TTFB often surface as:
+      // "Resource temporarily unavailable (www.eslproject.com:443)" then GetProductData null.
+      const { body, productCount, discountCount } = await getBufferedCsv(location, limit);
+      const bytes = new TextEncoder().encode(body);
+
+      const response = new NextResponse(bytes, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `inline; filename="treez-sandiego-test-${location.replace(/\s+/g, "-").toLowerCase()}.csv"`,
+          "Content-Length": String(bytes.byteLength),
+          // Prevent CDN/browser from serving a pre-barcode-removal CSV
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+          "Pragma": "no-cache",
+          "X-ESL-CSV-Version": "sandiego-test-threshold-location-only-v1",
+          "Connection": "close",
+        },
+      });
+
+      console.log(
+        `${LOG_PREFIX} ✓ CSV response ready: ${productCount} rows, ${discountCount} discounts, ${bytes.byteLength} bytes`
+      );
+      return applyCors(request, response);
+    }
+
+    // JSON response — same debug Treez filters (library default page_size; page 1 only for JSON preview)
+    const fetchedProducts = await fetchTreezProducts({
+      above_threshold: true,
+      sellable_quantity_in_location: location,
+      page: 1,
+      dispensary: TREEZ_DISPENSARY_SAN_DIEGO,
+      apiKey: TREEZ_API_KEY_SAN_DIEGO,
+    });
+    const products = limit ? fetchedProducts.slice(0, limit) : fetchedProducts.slice(0, 500);
+
+    const discountCount = products.filter(
+      (p) => getBestActiveDiscount(p as Record<string, unknown>) !== null
+    ).length;
+
+    console.log(`${LOG_PREFIX} Fetched ${products.length} products, ${discountCount} with active discounts`);
+
+    const enrichedProducts = products.map((product: Record<string, unknown>) => {
+      const standardPriceNum = toStandardPrice(product);
+      const bestDiscount = getBestActiveDiscount(product);
+      return {
+        ...product,
+        resolved_discount: bestDiscount
+          ? {
+              discount_title: bestDiscount.title,
+              discount_percent: bestDiscount.percent,
+              standard_price: standardPriceNum,
+              sale_price: parseFloat(
+                Math.max(0, standardPriceNum * (1 - bestDiscount.percent / 100)).toFixed(2)
+              ),
+            }
+          : null,
+      };
+    });
+
+    return applyCors(request, NextResponse.json({
+      success: true,
+      debug: true,
+      fetch_params: {
+        above_threshold: true,
+        sellable_quantity_in_location: location,
+        note: "omitted active + include_discounts; page_size = library default",
+      },
+      dispensary: TREEZ_DISPENSARY_SAN_DIEGO,
+      location,
+      limit: limit ?? null,
+      total: enrichedProducts.length,
+      discounts_applied: discountCount,
+      products: enrichedProducts,
+    }));
+
+  } catch (error: any) {
+    console.error(`${LOG_PREFIX} Error:`, error);
+    if (wantsCsv) {
+      // Fail loudly for Opticon — empty 200 CSV causes GetProductData null crashes.
+      return applyCors(request, new NextResponse(
+        `ERROR: ${error?.message || "Failed to fetch products"}\r\n`,
+        {
+          status: 503,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Retry-After": "30",
+          },
+        }
+      ));
+    }
+    return applyCors(request, NextResponse.json(
+      { error: error.message || "Failed to fetch products" },
+      { status: 500 }
+    ));
+  }
+}
