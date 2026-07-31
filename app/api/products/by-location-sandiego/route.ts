@@ -358,7 +358,7 @@ async function getCachedOrFetchProducts(location: string): Promise<Record<string
   console.log(`[Location API SD] Cache MISS for ${location} - fetching from Treez (${TREEZ_DISPENSARY_SAN_DIEGO})...`);
   const products = await fetchTreezProducts({
     active: "ALL",
-    above_threshold: false,
+    above_threshold: true,
     sellable_quantity_in_location: location,
     include_discounts: true,
     page_size: 500,
@@ -469,7 +469,7 @@ export async function GET(request: NextRequest) {
     const treezPageSize = limit !== undefined ? Math.max(limit, 100) : 500;
     const fetchedProducts = await fetchTreezProducts({
       active: "ALL",
-      above_threshold: false,
+      above_threshold: true,
       sellable_quantity_in_location: location,
       include_discounts: true,
       page_size: treezPageSize,
